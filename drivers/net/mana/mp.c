@@ -133,7 +133,7 @@ mana_mp_reset_enter(struct rte_eth_dev *dev)
 	proc_priv->db_page = (void *)0;
 
 	if (addr)
-		(void) munmap(addr, rte_mem_page_size());
+		(void)munmap(addr, rte_mem_page_size());
 
 	DRV_LOG(DEBUG, "All secondary threads are quiescent");
 	return 0;
