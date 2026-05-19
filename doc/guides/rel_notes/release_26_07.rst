@@ -55,6 +55,14 @@ New Features
      Also, make sure to start the actual text at the margin.
      =======================================================
 
+* **Added device reset support to the MANA PMD.**
+
+  Added automatic recovery from hardware service reset events
+  in the MANA poll mode driver. The driver uses ethdev recovery events
+  (``RTE_ETH_EVENT_ERR_RECOVERING``, ``RTE_ETH_EVENT_RECOVERY_SUCCESS``,
+  ``RTE_ETH_EVENT_RECOVERY_FAILED``) to notify upper layers of the
+  reset lifecycle.
+
 
 Removed Items
 -------------
