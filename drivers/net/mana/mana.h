@@ -385,7 +385,6 @@ struct mana_priv {
 	struct mana_mr_btree mr_btree;
 	rte_spinlock_t	mr_btree_lock;
 	RTE_ATOMIC(enum mana_device_state) dev_state;
-	struct rte_rcu_qsbr *dev_state_qsv;
 	/* mutex for synchronizing mana reset and some mana_dev_ops callbacks */
 	pthread_mutex_t reset_ops_lock;
 	/* Reset thread ID, valid when reset_thread_active is true */
@@ -454,6 +453,8 @@ struct mana_txq {
 	struct mana_stats stats;
 	unsigned int socket;
 	unsigned int txq_idx;
+
+	RTE_ATOMIC(bool) in_burst;
 };
 
 struct mana_rxq {
@@ -490,6 +491,8 @@ struct mana_rxq {
 
 	unsigned int socket;
 	unsigned int rxq_idx;
+
+	RTE_ATOMIC(bool) in_burst;
 };
 
 extern int mana_logtype_driver;

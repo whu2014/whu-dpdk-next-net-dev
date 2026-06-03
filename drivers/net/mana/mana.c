@@ -15,8 +15,6 @@
 #include <rte_eal_paging.h>
 #include <rte_alarm.h>
 #include <rte_pci.h>
-#include <rte_rcu_qsbr.h>
-#include <rte_lock_annotations.h>
 
 #include <infiniband/verbs.h>
 #include <infiniband/manadv.h>
@@ -108,21 +106,6 @@ mana_dev_configure(struct rte_eth_dev *dev)
 	priv->num_queues = dev->data->nb_rx_queues;
 	DRV_LOG(DEBUG, "priv %p, port %u, dev port %u, num_queues: %u",
 		priv, priv->port_id, priv->dev_port, priv->num_queues);
-
-	/*
-	 * Register data path thread IDs (rx and tx) with the RCU
-	 * quiescent state variable for device state synchronization.
-	 */
-	for (int i = 0; i < 2 * priv->num_queues; i++) {
-		if (rte_rcu_qsbr_thread_register(priv->dev_state_qsv, i) != 0) {
-			DRV_LOG(ERR, "Failed to register rcu qsv thread %d of total %d",
-				i, 2 * priv->num_queues - 1);
-			return -EINVAL;
-		}
-		DRV_LOG(DEBUG,
-			"Register thread 0x%x for priv %p, port %u",
-			i, priv, priv->port_id);
-	}
 
 	manadv_set_context_attr(priv->ib_ctx, MANADV_CTX_ATTR_BUF_ALLOCATORS,
 				(void *)((uintptr_t)&(struct manadv_ctx_allocators){
@@ -357,10 +340,6 @@ mana_dev_free_resources(struct rte_eth_dev *dev)
 {
 	struct mana_priv *priv = dev->data->dev_private;
 
-	if (priv->dev_state_qsv) {
-		rte_free(priv->dev_state_qsv);
-		priv->dev_state_qsv = NULL;
-	}
 	pthread_mutex_destroy(&priv->reset_ops_lock);
 	pthread_mutex_destroy(&priv->reset_cond_mutex);
 	pthread_cond_destroy(&priv->reset_cond);
@@ -1435,7 +1414,7 @@ static void
 mana_reset_enter(struct mana_priv *priv)
 {
 	int ret;
-	uint64_t ticket;
+	int i;
 	struct rte_eth_dev *dev = &rte_eth_devices[priv->port_id];
 
 	/*
@@ -1458,12 +1437,22 @@ mana_reset_enter(struct mana_priv *priv)
 	DRV_LOG(DEBUG, "Entering into device reset state");
 	DRV_LOG(DEBUG, "Resetting dev = %p, priv = %p", dev, priv);
 
-	ticket = rte_rcu_qsbr_start(priv->dev_state_qsv);
+	/* Wait for all in-flight burst calls to finish */
+	for (i = 0; i < priv->num_queues; i++) {
+		struct mana_rxq *rxq = dev->data->rx_queues[i];
+		struct mana_txq *txq = dev->data->tx_queues[i];
 
-	while (rte_rcu_qsbr_check(priv->dev_state_qsv, ticket, false) == 0)
-		rte_pause();
+		if (rxq)
+			while (rte_atomic_load_explicit(&rxq->in_burst,
+				    rte_memory_order_acquire))
+				rte_pause();
+		if (txq)
+			while (rte_atomic_load_explicit(&txq->in_burst,
+				    rte_memory_order_acquire))
+				rte_pause();
+	}
 
-	DRV_LOG(DEBUG, "All threads are quiescent");
+	DRV_LOG(DEBUG, "All data path threads drained");
 
 	/* Stop data path on primary and secondary before unmapping doorbell */
 	ret = mana_dev_stop(dev);
@@ -1492,7 +1481,7 @@ mana_reset_enter(struct mana_priv *priv)
 		goto reset_failed;
 	}
 
-	for (int i = 0; i < priv->num_queues; i++) {
+	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 		struct mana_txq *txq = dev->data->tx_queues[i];
 
@@ -2040,7 +2029,6 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 	char name[RTE_ETH_NAME_MAX_LEN];
 	int ret;
 	struct ibv_context *ctx = NULL;
-	size_t sz;
 	bool is_reset = false;
 	pthread_mutexattr_t mattr;
 	pthread_condattr_t cattr;
@@ -2192,25 +2180,6 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 
 	rte_eth_copy_pci_info(eth_dev, pci_dev);
 
-	/*
-	 * Now we've got maximum queues. Init the qsv to be the
-	 * double of maximum queues for both rx and tx queues.
-	 */
-	sz = rte_rcu_qsbr_get_memsize(2 * priv->max_rx_queues);
-	priv->dev_state_qsv = rte_zmalloc_socket("mana_rcu", sz,
-					    RTE_CACHE_LINE_SIZE,
-					    SOCKET_ID_ANY);
-	if (!priv->dev_state_qsv) {
-		DRV_LOG(ERR, "No memory for dev_state_qsv");
-		ret = -ENOMEM;
-		goto failed;
-	}
-	ret = rte_rcu_qsbr_init(priv->dev_state_qsv, 2 * priv->max_rx_queues);
-	if (ret < 0) {
-		DRV_LOG(ERR, "Init dev_state_qsv failed ret %d", ret);
-		goto failed;
-	}
-
 	pthread_mutexattr_init(&mattr);
 	pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
 	pthread_mutex_init(&priv->reset_ops_lock, &mattr);
@@ -2248,9 +2217,6 @@ out:
 failed:
 	/* Free the resource for the port failed */
 	if (priv) {
-		if (!is_reset && priv->dev_state_qsv)
-			rte_free(priv->dev_state_qsv);
-
 		if (priv->ib_parent_pd) {
 			ibv_dealloc_pd(priv->ib_parent_pd);
 			priv->ib_parent_pd = NULL;

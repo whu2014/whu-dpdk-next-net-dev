@@ -3,7 +3,6 @@
  */
 
 #include <ethdev_driver.h>
-#include <rte_rcu_qsbr.h>
 
 #include <infiniband/verbs.h>
 #include <infiniband/manadv.h>
@@ -194,8 +193,6 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	void *db_page;
 	uint16_t pkt_sent = 0;
 	uint32_t num_comp, i;
-	unsigned int tid = priv->num_queues + txq->txq_idx;
-	struct rte_rcu_qsbr *dstate_qsv = priv->dev_state_qsv;
 #ifdef RTE_ARCH_32
 	uint32_t wqe_count = 0;
 #endif
@@ -209,12 +206,14 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 		db_page = process_priv->db_page;
 	}
 
-	rte_rcu_qsbr_thread_online(dstate_qsv, tid);
+	rte_atomic_store_explicit(&txq->in_burst, true,
+				  rte_memory_order_release);
 
 	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) != MANA_DEV_ACTIVE || !db_page)) {
 		/* Device reset event occurred. */
-		rte_rcu_qsbr_thread_offline(dstate_qsv, tid);
+		rte_atomic_store_explicit(&txq->in_burst, false,
+					  rte_memory_order_release);
 		return 0;
 	}
 
@@ -517,7 +516,8 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 			DP_LOG(ERR, "mana_ring_doorbell failed ret %d", ret);
 	}
 
-	rte_rcu_qsbr_thread_offline(dstate_qsv, tid);
+	rte_atomic_store_explicit(&txq->in_burst, false,
+				  rte_memory_order_release);
 
 	return pkt_sent;
 }

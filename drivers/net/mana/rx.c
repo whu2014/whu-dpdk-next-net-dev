@@ -2,7 +2,6 @@
  * Copyright 2022 Microsoft Corporation
  */
 #include <ethdev_driver.h>
-#include <rte_rcu_qsbr.h>
 
 #include <infiniband/verbs.h>
 #include <infiniband/manadv.h>
@@ -460,15 +459,15 @@ mana_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	uint32_t pkt_len;
 	uint32_t i;
 	int polled = 0;
-	struct rte_rcu_qsbr *dstate_qsv = priv->dev_state_qsv;
-	unsigned int tid = rxq->rxq_idx;
 
-	rte_rcu_qsbr_thread_online(dstate_qsv, tid);
+	rte_atomic_store_explicit(&rxq->in_burst, true,
+				  rte_memory_order_release);
 
 	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) != MANA_DEV_ACTIVE)) {
 		/* Device reset occurred. */
-		rte_rcu_qsbr_thread_offline(dstate_qsv, tid);
+		rte_atomic_store_explicit(&rxq->in_burst, false,
+					  rte_memory_order_release);
 		return 0;
 	}
 
@@ -612,7 +611,8 @@ drop:
 				wqe_consumed, ret);
 	}
 
-	rte_rcu_qsbr_thread_offline(dstate_qsv, tid);
+	rte_atomic_store_explicit(&rxq->in_burst, false,
+				  rte_memory_order_release);
 
 	return pkt_received;
 }
