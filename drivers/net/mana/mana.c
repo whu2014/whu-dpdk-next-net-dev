@@ -13,7 +13,6 @@
 #include <ethdev_pci.h>
 #include <rte_kvargs.h>
 #include <rte_eal_paging.h>
-#include <rte_alarm.h>
 #include <rte_pci.h>
 
 #include <infiniband/verbs.h>
@@ -431,6 +430,25 @@ mana_dev_info_get(struct rte_eth_dev *dev,
 	return 0;
 }
 
+/*
+ * Try to acquire the reset lock and verify the device is active.
+ * Returns 0 with lock held on success, or -EBUSY if the lock
+ * could not be acquired or the device is not in ACTIVE state.
+ */
+static int
+mana_reset_trylock(struct mana_priv *priv)
+{
+	if (pthread_mutex_trylock(&priv->reset_ops_lock))
+		return -EBUSY;
+
+	if (rte_atomic_load_explicit(&priv->dev_state,
+	    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
+		pthread_mutex_unlock(&priv->reset_ops_lock);
+		return -EBUSY;
+	}
+	return 0;
+}
+
 static int
 mana_dev_info_get_lock(struct rte_eth_dev *dev,
 		       struct rte_eth_dev_info *dev_info)
@@ -438,17 +456,10 @@ mana_dev_info_get_lock(struct rte_eth_dev *dev,
 	struct mana_priv *priv = dev->data->dev_private;
 	int ret;
 
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {
-		if (rte_atomic_load_explicit(&priv->dev_state,
-		    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
-			pthread_mutex_unlock(&priv->reset_ops_lock);
-			return -EBUSY;
-		}
-		ret = mana_dev_info_get(dev, dev_info);
-		pthread_mutex_unlock(&priv->reset_ops_lock);
-	} else {
-		ret = -EBUSY;
-	}
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_dev_info_get(dev, dev_info);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
 	return ret;
 }
 
@@ -621,18 +632,11 @@ mana_dev_tx_queue_setup_lock(struct rte_eth_dev *dev, uint16_t queue_idx,
 	struct mana_priv *priv = dev->data->dev_private;
 	int ret;
 
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {
-		if (rte_atomic_load_explicit(&priv->dev_state,
-		    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
-			pthread_mutex_unlock(&priv->reset_ops_lock);
-			return -EBUSY;
-		}
-		ret = mana_dev_tx_queue_setup(dev, queue_idx,
-					      nb_desc, socket_id, tx_conf);
-		pthread_mutex_unlock(&priv->reset_ops_lock);
-	} else {
-		ret = -EBUSY;
-	}
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_dev_tx_queue_setup(dev, queue_idx,
+				      nb_desc, socket_id, tx_conf);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
 	return ret;
 }
 
@@ -722,18 +726,11 @@ mana_dev_rx_queue_setup_lock(struct rte_eth_dev *dev, uint16_t queue_idx,
 	struct mana_priv *priv = dev->data->dev_private;
 	int ret;
 
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {
-		if (rte_atomic_load_explicit(&priv->dev_state,
-		    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
-			pthread_mutex_unlock(&priv->reset_ops_lock);
-			return -EBUSY;
-		}
-		ret = mana_dev_rx_queue_setup(dev, queue_idx, nb_desc,
-					      socket_id, rx_conf, mp);
-		pthread_mutex_unlock(&priv->reset_ops_lock);
-	} else {
-		ret = -EBUSY;
-	}
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_dev_rx_queue_setup(dev, queue_idx, nb_desc,
+				      socket_id, rx_conf, mp);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
 	return ret;
 }
 
@@ -928,32 +925,31 @@ mana_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
 	return mana_ifreq(priv, SIOCSIFMTU, &request);
 }
 
-#define MANA_OPS_1_LOCK(_func)						\
-static int								\
-_func##_lock(struct rte_eth_dev *dev)					\
-{									\
-	struct mana_priv *priv = dev->data->dev_private;		\
-	int ret;							\
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {		\
-		if (rte_atomic_load_explicit(&priv->dev_state,		\
-		    rte_memory_order_acquire) !=			\
-		    MANA_DEV_ACTIVE) {					\
-			pthread_mutex_unlock(&priv->reset_ops_lock);	\
-			return -EBUSY;					\
-		}							\
-		ret = _func(dev);					\
-		pthread_mutex_unlock(&priv->reset_ops_lock);		\
-	} else {							\
-		ret = -EBUSY;						\
-	}								\
-	return ret;							\
+static int
+mana_dev_configure_lock(struct rte_eth_dev *dev)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
+
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_dev_configure(dev);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
 }
 
-MANA_OPS_1_LOCK(mana_dev_configure)
+static int
+mana_dev_start_lock(struct rte_eth_dev *dev)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
 
-MANA_OPS_1_LOCK(mana_dev_start)
-
-#undef MANA_OPS_1_LOCK
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_dev_start(dev);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
+}
 
 /*
  * Join the reset thread if it is active. Uses CAS on
@@ -1028,87 +1024,100 @@ mana_dev_close_lock(struct rte_eth_dev *dev)
 	return ret;
 }
 
-#define MANA_OPS_2_LOCK(_func)						\
-static int								\
-_func##_lock(struct rte_eth_dev *dev,					\
-	       struct rte_eth_rss_conf *rss_conf)			\
-{									\
-	struct mana_priv *priv = dev->data->dev_private;		\
-	int ret;							\
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {		\
-		if (rte_atomic_load_explicit(&priv->dev_state,		\
-		    rte_memory_order_acquire) !=			\
-		    MANA_DEV_ACTIVE) {					\
-			pthread_mutex_unlock(&priv->reset_ops_lock);	\
-			return -EBUSY;					\
-		}							\
-		ret = _func(dev, rss_conf);				\
-		pthread_mutex_unlock(&priv->reset_ops_lock);		\
-	} else {							\
-		ret = -EBUSY;						\
-	}								\
-	return ret;							\
+static int
+mana_rss_hash_update_lock(struct rte_eth_dev *dev,
+			  struct rte_eth_rss_conf *rss_conf)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
+
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_rss_hash_update(dev, rss_conf);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
 }
 
-MANA_OPS_2_LOCK(mana_rss_hash_update)
+static int
+mana_rss_hash_conf_get_lock(struct rte_eth_dev *dev,
+			    struct rte_eth_rss_conf *rss_conf)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
 
-MANA_OPS_2_LOCK(mana_rss_hash_conf_get)
-#undef MANA_OPS_2_LOCK
-
-#define MANA_OPS_3_LOCK(_func, _arg)					\
-static void								\
-_func##_lock(struct rte_eth_dev *dev, uint16_t _arg)			\
-{									\
-	struct mana_priv *priv = dev->data->dev_private;		\
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {		\
-		if (rte_atomic_load_explicit(&priv->dev_state,		\
-		    rte_memory_order_acquire) !=			\
-		    MANA_DEV_ACTIVE) {					\
-			pthread_mutex_unlock(&priv->reset_ops_lock);	\
-			DRV_LOG(ERR, "Device reset in progress, "	\
-				"%s not called", #_func);		\
-			return;						\
-		}							\
-		_func(dev, _arg);					\
-		pthread_mutex_unlock(&priv->reset_ops_lock);		\
-	} else {							\
-		DRV_LOG(ERR, "Device reset in progress, "		\
-			"%s not called", #_func);			\
-	}								\
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_rss_hash_conf_get(dev, rss_conf);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
 }
 
-MANA_OPS_3_LOCK(mana_dev_tx_queue_release, qid)
+static void
+mana_dev_tx_queue_release_lock(struct rte_eth_dev *dev, uint16_t qid)
+{
+	struct mana_priv *priv = dev->data->dev_private;
 
-MANA_OPS_3_LOCK(mana_dev_rx_queue_release, qid)
-#undef MANA_OPS_3_LOCK
-
-#define MANA_OPS_4_LOCK(_func, _arg)					\
-static int								\
-_func##_lock(struct rte_eth_dev *dev, uint16_t _arg)			\
-{									\
-	struct mana_priv *priv = dev->data->dev_private;		\
-	int ret;							\
-	if (!pthread_mutex_trylock(&priv->reset_ops_lock)) {		\
-		if (rte_atomic_load_explicit(&priv->dev_state,		\
-		    rte_memory_order_acquire) !=			\
-		    MANA_DEV_ACTIVE) {					\
-			pthread_mutex_unlock(&priv->reset_ops_lock);	\
-			return -EBUSY;					\
-		}							\
-		ret = _func(dev, _arg);					\
-		pthread_mutex_unlock(&priv->reset_ops_lock);		\
-	} else {							\
-		ret = -EBUSY;						\
-	}								\
-	return ret;							\
+	if (mana_reset_trylock(priv)) {
+		DRV_LOG(ERR, "Device reset in progress, "
+			"mana_dev_tx_queue_release not called");
+		return;
+	}
+	mana_dev_tx_queue_release(dev, qid);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
 }
 
-MANA_OPS_4_LOCK(mana_rx_intr_enable, rx_queue_id)
+static void
+mana_dev_rx_queue_release_lock(struct rte_eth_dev *dev, uint16_t qid)
+{
+	struct mana_priv *priv = dev->data->dev_private;
 
-MANA_OPS_4_LOCK(mana_rx_intr_disable, rx_queue_id)
+	if (mana_reset_trylock(priv)) {
+		DRV_LOG(ERR, "Device reset in progress, "
+			"mana_dev_rx_queue_release not called");
+		return;
+	}
+	mana_dev_rx_queue_release(dev, qid);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+}
 
-MANA_OPS_4_LOCK(mana_mtu_set, mtu)
-#undef MANA_OPS_4_LOCK
+static int
+mana_rx_intr_enable_lock(struct rte_eth_dev *dev, uint16_t rx_queue_id)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
+
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_rx_intr_enable(dev, rx_queue_id);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
+}
+
+static int
+mana_rx_intr_disable_lock(struct rte_eth_dev *dev, uint16_t rx_queue_id)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
+
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_rx_intr_disable(dev, rx_queue_id);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
+}
+
+static int
+mana_mtu_set_lock(struct rte_eth_dev *dev, uint16_t mtu)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int ret;
+
+	if (mana_reset_trylock(priv))
+		return -EBUSY;
+	ret = mana_mtu_set(dev, mtu);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
+}
 
 static const struct eth_dev_ops mana_dev_ops = {
 	.dev_configure		= mana_dev_configure_lock,
