@@ -1355,14 +1355,13 @@ mana_pci_remove_event_cb(const char *device_name,
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
 
 	pthread_mutex_lock(&priv->reset_ops_lock);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
 
 	dev = &rte_eth_devices[priv->port_id];
 	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_INTR_RMV for port %u",
 		priv->port_id);
 	rte_eth_dev_callback_process(dev,
 		RTE_ETH_EVENT_INTR_RMV, NULL);
-
-	pthread_mutex_unlock(&priv->reset_ops_lock);
 }
 
 /*
@@ -1623,21 +1622,7 @@ mana_reset_exit_delay(void *arg)
 				     rte_memory_order_release);
 
 	DRV_LOG(DEBUG, "Exiting the reset complete processing");
-
-	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
-		priv->port_id);
-	rte_eth_dev_callback_process(dev,
-		RTE_ETH_EVENT_RECOVERY_SUCCESS, NULL);
-
-out:
-	if (ret) {
-		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
-			priv->port_id);
-		rte_eth_dev_callback_process(dev,
-			RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
-	}
-	pthread_mutex_unlock(&priv->reset_ops_lock);
-	return ret;
+	goto out;
 
 mr_init_failed_all:
 	i = priv->num_queues;
@@ -1660,12 +1645,20 @@ mr_init_failed_rxq:
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
 				     rte_memory_order_release);
 
-	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED (MR init) for port %u",
-		priv->port_id);
-	rte_eth_dev_callback_process(dev,
-		RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
-
+out:
 	pthread_mutex_unlock(&priv->reset_ops_lock);
+
+	if (!ret) {
+		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
+			priv->port_id);
+		rte_eth_dev_callback_process(dev,
+			RTE_ETH_EVENT_RECOVERY_SUCCESS, NULL);
+	} else {
+		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
+			priv->port_id);
+		rte_eth_dev_callback_process(dev,
+			RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
+	}
 	return ret;
 }
 
