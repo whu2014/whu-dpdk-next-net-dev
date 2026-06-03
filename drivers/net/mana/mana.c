@@ -1359,7 +1359,6 @@ static void mana_reset_exit(struct mana_priv *priv);
 static void
 mana_pci_remove_event_cb(const char *device_name,
 			 enum rte_dev_event_type event, void *cb_arg)
-	__rte_no_thread_safety_analysis
 {
 	struct mana_priv *priv = cb_arg;
 	struct rte_eth_dev *dev;
@@ -1394,7 +1393,6 @@ mana_pci_remove_event_cb(const char *device_name,
  */
 static uint32_t
 mana_reset_thread(void *arg)
-	__rte_no_thread_safety_analysis
 {
 	struct mana_priv *priv = (struct mana_priv *)arg;
 	struct timespec ts;
@@ -1435,7 +1433,6 @@ mana_reset_thread(void *arg)
 
 static void
 mana_reset_enter(struct mana_priv *priv)
-	__rte_no_thread_safety_analysis
 {
 	int ret;
 	uint64_t ticket;
@@ -1551,7 +1548,6 @@ reset_failed:
 
 static uint32_t
 mana_reset_exit_delay(void *arg)
-	__rte_no_thread_safety_analysis
 {
 	struct mana_priv *priv = (struct mana_priv *)arg;
 	uint32_t ret = 0;
@@ -1686,7 +1682,6 @@ mr_init_failed_rxq:
 
 static void
 mana_reset_exit(struct mana_priv *priv)
-	__rte_no_thread_safety_analysis
 {
 	int ret;
 
@@ -1729,7 +1724,6 @@ mana_reset_exit(struct mana_priv *priv)
  */
 static void
 mana_intr_handler(void *arg)
-	__rte_no_thread_safety_analysis
 {
 	struct mana_priv *priv = arg;
 	struct ibv_context *ctx = priv->ib_ctx;
