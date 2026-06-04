@@ -36,6 +36,11 @@ mana_rq_ring_doorbell(struct mana_rxq *rxq)
 		db_page = process_priv->db_page;
 	}
 
+	if (!db_page) {
+		DP_LOG(ERR, "db_page is NULL, cannot ring RX doorbell");
+		return -EINVAL;
+	}
+
 	/* Hardware Spec specifies that software client should set 0 for
 	 * wqe_cnt for Receive Queues.
 	 */
@@ -172,7 +177,7 @@ mana_stop_rx_queues(struct rte_eth_dev *dev)
 
 	for (i = 0; i < priv->num_queues; i++)
 		if (dev->data->rx_queue_state[i] == RTE_ETH_QUEUE_STATE_STOPPED)
-			return -EINVAL;
+			return 0;
 
 	if (priv->rwq_qp) {
 		ret = ibv_destroy_qp(priv->rwq_qp);
@@ -255,6 +260,9 @@ mana_start_rx_queues(struct rte_eth_dev *dev)
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 		struct ibv_wq_init_attr wq_attr = {};
+
+		rxq->rxq_idx = i;
+		DRV_LOG(DEBUG, "assigning rxq_idx to %d", i);
 
 		manadv_set_context_attr(priv->ib_ctx,
 			MANADV_CTX_ATTR_BUF_ALLOCATORS,
@@ -452,6 +460,17 @@ mana_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	uint32_t i;
 	int polled = 0;
 
+	rte_atomic_store_explicit(&rxq->in_burst, true,
+				  rte_memory_order_seq_cst);
+
+	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
+			    rte_memory_order_acquire) != MANA_DEV_ACTIVE)) {
+		/* Device reset occurred. */
+		rte_atomic_store_explicit(&rxq->in_burst, false,
+					  rte_memory_order_release);
+		return 0;
+	}
+
 repoll:
 	/* Polling on new completions if we have no backlog */
 	if (rxq->comp_buf_idx == rxq->comp_buf_len) {
@@ -591,6 +610,9 @@ drop:
 			DRV_LOG(ERR, "failed to post %d WQEs, ret %d",
 				wqe_consumed, ret);
 	}
+
+	rte_atomic_store_explicit(&rxq->in_burst, false,
+				  rte_memory_order_release);
 
 	return pkt_received;
 }

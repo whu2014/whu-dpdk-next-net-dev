@@ -17,7 +17,7 @@ mana_stop_tx_queues(struct rte_eth_dev *dev)
 
 	for (i = 0; i < priv->num_queues; i++)
 		if (dev->data->tx_queue_state[i] == RTE_ETH_QUEUE_STATE_STOPPED)
-			return -EINVAL;
+			return 0;
 
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_txq *txq = dev->data->tx_queues[i];
@@ -82,6 +82,9 @@ mana_start_tx_queues(struct rte_eth_dev *dev)
 		struct manadv_cq dv_cq;
 
 		txq = dev->data->tx_queues[i];
+
+		txq->txq_idx = i;
+		DRV_LOG(DEBUG, "assigning txq_idx to %d", txq->txq_idx);
 
 		manadv_set_context_attr(priv->ib_ctx,
 			MANADV_CTX_ATTR_BUF_ALLOCATORS,
@@ -194,6 +197,26 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	uint32_t wqe_count = 0;
 #endif
 
+	db_page = priv->db_page;
+	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
+		struct rte_eth_dev *dev =
+			&rte_eth_devices[priv->dev_data->port_id];
+		struct mana_process_priv *process_priv = dev->process_private;
+
+		db_page = process_priv->db_page;
+	}
+
+	rte_atomic_store_explicit(&txq->in_burst, true,
+				  rte_memory_order_seq_cst);
+
+	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
+			    rte_memory_order_acquire) != MANA_DEV_ACTIVE || !db_page)) {
+		/* Device reset event occurred. */
+		rte_atomic_store_explicit(&txq->in_burst, false,
+					  rte_memory_order_release);
+		return 0;
+	}
+
 	/* Process send completions from GDMA */
 	num_comp = gdma_poll_completion_queue(&txq->gdma_cq,
 			txq->gdma_comp_buf, txq->num_desc);
@@ -216,7 +239,8 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 		}
 
 		if (!desc->pkt) {
-			DP_LOG(ERR, "mana_txq_desc has a NULL pkt");
+			DP_LOG(ERR, "mana_txq_desc has a NULL pkt, priv %p, "
+			       "txq = %d", priv, txq->txq_idx);
 		} else {
 			txq->stats.bytes += desc->pkt->pkt_len;
 			rte_pktmbuf_free(desc->pkt);
@@ -474,15 +498,6 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	}
 
 	/* Ring hardware door bell */
-	db_page = priv->db_page;
-	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
-		struct rte_eth_dev *dev =
-			&rte_eth_devices[priv->dev_data->port_id];
-		struct mana_process_priv *process_priv = dev->process_private;
-
-		db_page = process_priv->db_page;
-	}
-
 	if (pkt_sent) {
 #ifdef RTE_ARCH_32
 		ret = mana_ring_short_doorbell(db_page, GDMA_QUEUE_SEND,
@@ -500,6 +515,9 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 		if (ret)
 			DP_LOG(ERR, "mana_ring_doorbell failed ret %d", ret);
 	}
+
+	rte_atomic_store_explicit(&txq->in_burst, false,
+				  rte_memory_order_release);
 
 	return pkt_sent;
 }
