@@ -207,7 +207,7 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	}
 
 	rte_atomic_store_explicit(&txq->in_burst, true,
-				  rte_memory_order_release);
+				  rte_memory_order_seq_cst);
 
 	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) != MANA_DEV_ACTIVE || !db_page)) {

@@ -461,7 +461,7 @@ mana_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	int polled = 0;
 
 	rte_atomic_store_explicit(&rxq->in_burst, true,
-				  rte_memory_order_release);
+				  rte_memory_order_seq_cst);
 
 	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) != MANA_DEV_ACTIVE)) {

@@ -1440,7 +1440,7 @@ mana_reset_enter(struct mana_priv *priv)
 	 */
 
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_ENTER,
-				     rte_memory_order_release);
+				     rte_memory_order_seq_cst);
 
 	DRV_LOG(DEBUG, "Entering into device reset state");
 	DRV_LOG(DEBUG, "Resetting dev = %p, priv = %p", dev, priv);
@@ -1749,10 +1749,24 @@ mana_intr_handler(void *arg)
 				mana_reset_enter(priv);
 
 				dev = &rte_eth_devices[priv->port_id];
-				DRV_LOG(INFO, "Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
-					priv->port_id);
-				rte_eth_dev_callback_process(dev,
-					RTE_ETH_EVENT_ERR_RECOVERING, NULL);
+
+				if (rte_atomic_load_explicit(&priv->dev_state,
+				    rte_memory_order_acquire) ==
+				    MANA_DEV_RESET_FAILED) {
+					DRV_LOG(INFO,
+						"Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
+						priv->port_id);
+					rte_eth_dev_callback_process(dev,
+						RTE_ETH_EVENT_RECOVERY_FAILED,
+						NULL);
+				} else {
+					DRV_LOG(INFO,
+						"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
+						priv->port_id);
+					rte_eth_dev_callback_process(dev,
+						RTE_ETH_EVENT_ERR_RECOVERING,
+						NULL);
+				}
 			} else {
 				DRV_LOG(ERR, "Already in reset handling, dev_state=%d",
 					(int)rte_atomic_load_explicit(&priv->dev_state,
