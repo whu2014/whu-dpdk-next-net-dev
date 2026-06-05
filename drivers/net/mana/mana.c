@@ -1778,9 +1778,19 @@ mana_intr_handler(void *arg)
 						&priv->reset_ops_lock);
 					break;
 				}
-				mana_reset_enter(priv);
-
+				/* Notify upper layers (e.g. netvsc) before
+				 * entering reset so they can switch data
+				 * path before mana stops queues.
+				 */
 				dev = &rte_eth_devices[priv->port_id];
+				DRV_LOG(INFO,
+					"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
+					priv->port_id);
+				rte_eth_dev_callback_process(dev,
+					RTE_ETH_EVENT_ERR_RECOVERING,
+					NULL);
+
+				mana_reset_enter(priv);
 
 				if (rte_atomic_load_explicit(&priv->dev_state,
 				    rte_memory_order_acquire) ==
@@ -1790,13 +1800,6 @@ mana_intr_handler(void *arg)
 						priv->port_id);
 					rte_eth_dev_callback_process(dev,
 						RTE_ETH_EVENT_RECOVERY_FAILED,
-						NULL);
-				} else {
-					DRV_LOG(INFO,
-						"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
-						priv->port_id);
-					rte_eth_dev_callback_process(dev,
-						RTE_ETH_EVENT_ERR_RECOVERING,
 						NULL);
 				}
 			} else {
