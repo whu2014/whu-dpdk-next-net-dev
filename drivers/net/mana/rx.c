@@ -459,17 +459,16 @@ mana_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	uint32_t pkt_len;
 	uint32_t i;
 	int polled = 0;
+	uint32_t expected = 0;
 
-	rte_atomic_store_explicit(&rxq->in_burst, true,
-				  rte_memory_order_seq_cst);
-
-	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
-			    rte_memory_order_acquire) != MANA_DEV_ACTIVE)) {
-		/* Device reset occurred. */
-		rte_atomic_store_explicit(&rxq->in_burst, false,
-					  rte_memory_order_release);
+	/* Single atomic CAS: enter burst only if device is active (0→1).
+	 * Fails immediately if reset path has set state bits.
+	 */
+	if (unlikely(!rte_atomic_compare_exchange_strong_explicit(
+			&rxq->burst_state, &expected, 1,
+			rte_memory_order_acquire,
+			rte_memory_order_relaxed)))
 		return 0;
-	}
 
 repoll:
 	/* Polling on new completions if we have no backlog */
@@ -611,8 +610,8 @@ drop:
 				wqe_consumed, ret);
 	}
 
-	rte_atomic_store_explicit(&rxq->in_burst, false,
-				  rte_memory_order_release);
+	rte_atomic_fetch_and_explicit(&rxq->burst_state, ~(uint32_t)1,
+				     rte_memory_order_release);
 
 	return pkt_received;
 }

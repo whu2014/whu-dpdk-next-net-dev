@@ -1440,23 +1440,40 @@ mana_reset_enter(struct mana_priv *priv)
 	 */
 
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_ENTER,
-				     rte_memory_order_seq_cst);
+				     rte_memory_order_release);
 
 	DRV_LOG(DEBUG, "Entering into device reset state");
 	DRV_LOG(DEBUG, "Resetting dev = %p, priv = %p", dev, priv);
 
-	/* Wait for all in-flight burst calls to finish */
+	/* Set state bits on each queue's burst_state so new bursts are
+	 * rejected, then wait for any in-flight burst (bit 0) to finish.
+	 */
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 		struct mana_txq *txq = dev->data->tx_queues[i];
 
 		if (rxq)
-			while (rte_atomic_load_explicit(&rxq->in_burst,
-				    rte_memory_order_acquire))
+			rte_atomic_fetch_or_explicit(&rxq->burst_state,
+				(uint32_t)(MANA_DEV_RESET_ENTER << 1),
+				rte_memory_order_release);
+		if (txq)
+			rte_atomic_fetch_or_explicit(&txq->burst_state,
+				(uint32_t)(MANA_DEV_RESET_ENTER << 1),
+				rte_memory_order_release);
+	}
+
+	/* Wait for all in-flight burst calls to finish (bit 0 to clear) */
+	for (i = 0; i < priv->num_queues; i++) {
+		struct mana_rxq *rxq = dev->data->rx_queues[i];
+		struct mana_txq *txq = dev->data->tx_queues[i];
+
+		if (rxq)
+			while (rte_atomic_load_explicit(&rxq->burst_state,
+				    rte_memory_order_acquire) & 1)
 				rte_pause();
 		if (txq)
-			while (rte_atomic_load_explicit(&txq->in_burst,
-				    rte_memory_order_acquire))
+			while (rte_atomic_load_explicit(&txq->burst_state,
+				    rte_memory_order_acquire) & 1)
 				rte_pause();
 	}
 
@@ -1625,6 +1642,21 @@ mana_reset_exit_delay(void *arg)
 	if (ret) {
 		DRV_LOG(ERR, "Failed to start mana dev ret %d", ret);
 		goto mr_init_failed_all;
+	}
+
+	/* Clear per-queue burst_state before marking device active so
+	 * data path CAS can succeed again.
+	 */
+	for (i = 0; i < priv->num_queues; i++) {
+		struct mana_rxq *rxq = dev->data->rx_queues[i];
+		struct mana_txq *txq = dev->data->tx_queues[i];
+
+		if (rxq)
+			rte_atomic_store_explicit(&rxq->burst_state, 0,
+						  rte_memory_order_release);
+		if (txq)
+			rte_atomic_store_explicit(&txq->burst_state, 0,
+						  rte_memory_order_release);
 	}
 
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_ACTIVE,

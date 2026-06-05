@@ -454,7 +454,12 @@ struct mana_txq {
 	unsigned int socket;
 	unsigned int txq_idx;
 
-	RTE_ATOMIC(bool) in_burst;
+	/*
+	 * Bit 0: in-burst flag (set by data path, cleared on exit).
+	 * Bits 1+: device state (set by reset path via fetch_or).
+	 * Data path CAS 0→1 to enter; fails if any state bits are set.
+	 */
+	RTE_ATOMIC(uint32_t) burst_state;
 };
 
 struct mana_rxq {
@@ -492,7 +497,12 @@ struct mana_rxq {
 	unsigned int socket;
 	unsigned int rxq_idx;
 
-	RTE_ATOMIC(bool) in_burst;
+	/*
+	 * Bit 0: in-burst flag (set by data path, cleared on exit).
+	 * Bits 1+: device state (set by reset path via fetch_or).
+	 * Data path CAS 0→1 to enter; fails if any state bits are set.
+	 */
+	RTE_ATOMIC(uint32_t) burst_state;
 };
 
 extern int mana_logtype_driver;

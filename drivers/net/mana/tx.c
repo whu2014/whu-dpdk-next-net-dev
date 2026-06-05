@@ -193,6 +193,7 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	void *db_page;
 	uint16_t pkt_sent = 0;
 	uint32_t num_comp, i;
+	uint32_t expected = 0;
 #ifdef RTE_ARCH_32
 	uint32_t wqe_count = 0;
 #endif
@@ -206,14 +207,17 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 		db_page = process_priv->db_page;
 	}
 
-	rte_atomic_store_explicit(&txq->in_burst, true,
-				  rte_memory_order_seq_cst);
-
-	if (unlikely(rte_atomic_load_explicit(&priv->dev_state,
-			    rte_memory_order_acquire) != MANA_DEV_ACTIVE || !db_page)) {
-		/* Device reset event occurred. */
-		rte_atomic_store_explicit(&txq->in_burst, false,
-					  rte_memory_order_release);
+	/* Single atomic CAS: enter burst only if device is active (0→1).
+	 * Fails immediately if reset path has set state bits.
+	 */
+	if (unlikely(!rte_atomic_compare_exchange_strong_explicit(
+			&txq->burst_state, &expected, 1,
+			rte_memory_order_acquire,
+			rte_memory_order_relaxed) || !db_page)) {
+		if (!expected) /* CAS succeeded but db_page NULL — undo */
+			rte_atomic_fetch_and_explicit(&txq->burst_state,
+						      ~(uint32_t)1,
+						      rte_memory_order_release);
 		return 0;
 	}
 
@@ -516,8 +520,8 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 			DP_LOG(ERR, "mana_ring_doorbell failed ret %d", ret);
 	}
 
-	rte_atomic_store_explicit(&txq->in_burst, false,
-				  rte_memory_order_release);
+	rte_atomic_fetch_and_explicit(&txq->burst_state, ~(uint32_t)1,
+				     rte_memory_order_release);
 
 	return pkt_sent;
 }
