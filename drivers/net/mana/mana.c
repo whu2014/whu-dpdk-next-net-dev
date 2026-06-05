@@ -974,6 +974,30 @@ mana_join_reset_thread(struct mana_priv *priv)
 }
 
 /*
+ * Clear per-queue burst_state so the data path CAS can succeed again.
+ * Must be called under reset_ops_lock when transitioning back to ACTIVE
+ * after a failed or aborted reset.
+ */
+static void
+mana_clear_burst_state(struct rte_eth_dev *dev)
+{
+	struct mana_priv *priv = dev->data->dev_private;
+	int i;
+
+	for (i = 0; i < priv->num_queues; i++) {
+		struct mana_rxq *rxq = dev->data->rx_queues[i];
+		struct mana_txq *txq = dev->data->tx_queues[i];
+
+		if (rxq)
+			rte_atomic_store_explicit(&rxq->burst_state, 0,
+						  rte_memory_order_release);
+		if (txq)
+			rte_atomic_store_explicit(&txq->burst_state, 0,
+						  rte_memory_order_release);
+	}
+}
+
+/*
  * Custom lock wrappers for dev_stop and dev_close.
  * These join any active reset thread and use a blocking lock (not
  * trylock) so they wait for any in-progress reset processing to
@@ -992,6 +1016,7 @@ mana_dev_stop_lock(struct rte_eth_dev *dev)
 
 	if (rte_atomic_load_explicit(&priv->dev_state,
 	    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
+		mana_clear_burst_state(dev);
 		rte_atomic_store_explicit(&priv->dev_state,
 			MANA_DEV_ACTIVE, rte_memory_order_release);
 		pthread_mutex_unlock(&priv->reset_ops_lock);
@@ -1015,6 +1040,7 @@ mana_dev_close_lock(struct rte_eth_dev *dev)
 
 	if (rte_atomic_load_explicit(&priv->dev_state,
 	    rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
+		mana_clear_burst_state(dev);
 		rte_atomic_store_explicit(&priv->dev_state,
 			MANA_DEV_ACTIVE, rte_memory_order_release);
 	}
@@ -1544,8 +1570,7 @@ mana_reset_enter(struct mana_priv *priv)
 		rte_atomic_store_explicit(&priv->dev_state,
 					  MANA_DEV_RESET_FAILED,
 					  rte_memory_order_release);
-		pthread_mutex_unlock(&priv->reset_ops_lock);
-		return;
+		goto reset_failed;
 	}
 	rte_atomic_store_explicit(&priv->reset_thread_active,
 		true, rte_memory_order_release);
@@ -1557,6 +1582,7 @@ mana_reset_enter(struct mana_priv *priv)
 	return;
 
 reset_failed:
+	mana_clear_burst_state(dev);
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 }
 
@@ -1765,6 +1791,20 @@ mana_intr_handler(void *arg)
 				rte_memory_order_acquire));
 			if (rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) == MANA_DEV_ACTIVE) {
+				/* Notify upper layers (e.g. netvsc) before
+				 * acquiring the lock so they can switch data
+				 * path before mana stops queues. Emitting
+				 * outside the lock avoids deadlock if the
+				 * callback calls dev_stop/dev_close.
+				 */
+				dev = &rte_eth_devices[priv->port_id];
+				DRV_LOG(INFO,
+					"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
+					priv->port_id);
+				rte_eth_dev_callback_process(dev,
+					RTE_ETH_EVENT_ERR_RECOVERING,
+					NULL);
+
 				pthread_mutex_lock(&priv->reset_ops_lock);
 
 				/* Re-check after lock to avoid racing with
@@ -1778,17 +1818,6 @@ mana_intr_handler(void *arg)
 						&priv->reset_ops_lock);
 					break;
 				}
-				/* Notify upper layers (e.g. netvsc) before
-				 * entering reset so they can switch data
-				 * path before mana stops queues.
-				 */
-				dev = &rte_eth_devices[priv->port_id];
-				DRV_LOG(INFO,
-					"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
-					priv->port_id);
-				rte_eth_dev_callback_process(dev,
-					RTE_ETH_EVENT_ERR_RECOVERING,
-					NULL);
 
 				mana_reset_enter(priv);
 

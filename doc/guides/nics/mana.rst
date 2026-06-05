@@ -83,7 +83,8 @@ via ``IBV_EVENT_DEVICE_FATAL``.
 The driver handles this transparently through a two-phase reset flow:
 
 * **Enter phase**: The driver stops the data path,
-  waits for all threads to reach a quiescent state using RCU,
+  waits for all in-flight burst calls to drain
+  using per-queue atomic flags,
   tears down IB resources and queues,
   and unmaps secondary process doorbell pages.
 
