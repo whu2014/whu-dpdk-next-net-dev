@@ -1608,7 +1608,7 @@ mana_reset_exit_delay(void *arg)
 	}
 
 	dev = &rte_eth_devices[priv->port_id];
-	pci_dev = RTE_ETH_DEV_TO_PCI(dev);
+	pci_dev = RTE_CLASS_TO_BUS_DEVICE(dev, *pci_dev);
 
 	DRV_LOG(DEBUG, "Resetting dev = %p, priv = %p", dev, priv);
 
