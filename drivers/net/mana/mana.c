@@ -1400,20 +1400,76 @@ mana_pci_remove_event_cb(const char *device_name,
 }
 
 /*
- * Reset thread: sleeps for the reset timer period, then performs
- * the reset exit sequence. Runs on a control thread so it can call
- * rte_intr_callback_unregister (which fails from alarm/intr thread).
+ * Reset thread: performs teardown immediately, waits for the
+ * recovery timer, then re-probes and restarts the device.
+ * Runs on a control thread so it can call blocking IPC, ibv
+ * teardown, and rte_intr_callback_unregister (which all must
+ * not run on the EAL interrupt thread).
  */
 static uint32_t
 mana_reset_thread(void *arg)
 {
 	struct mana_priv *priv = (struct mana_priv *)arg;
+	struct rte_eth_dev *dev = &rte_eth_devices[priv->port_id];
 	struct timespec ts;
+	int ret;
+	int i;
 
-	DRV_LOG(INFO, "Reset thread started, waiting %us",
+	DRV_LOG(INFO, "Reset thread started");
+
+	pthread_mutex_lock(&priv->reset_ops_lock);
+
+	/* Teardown: stop data path, unmap secondary doorbells, close device,
+	 * free MR caches. Must happen immediately — hardware may be gone.
+	 */
+	ret = mana_dev_stop(dev);
+	if (ret) {
+		DRV_LOG(ERR, "Failed to stop mana dev ret %d", ret);
+		rte_atomic_store_explicit(&priv->dev_state,
+			MANA_DEV_RESET_FAILED, rte_memory_order_release);
+		goto reset_failed;
+	}
+
+	ret = mana_mp_req_on_rxtx(dev, MANA_MP_REQ_RESET_ENTER);
+	if (ret) {
+		DRV_LOG(ERR, "Failed to reset secondary processes ret = %d",
+			ret);
+		rte_atomic_store_explicit(&priv->dev_state,
+			MANA_DEV_RESET_FAILED, rte_memory_order_release);
+		goto reset_failed;
+	}
+
+	ret = mana_dev_close(dev);
+	if (ret) {
+		DRV_LOG(ERR, "Failed to close mana dev ret %d", ret);
+		rte_atomic_store_explicit(&priv->dev_state,
+			MANA_DEV_RESET_FAILED, rte_memory_order_release);
+		goto reset_failed;
+	}
+
+	for (i = 0; i < priv->num_queues; i++) {
+		struct mana_rxq *rxq = dev->data->rx_queues[i];
+		struct mana_txq *txq = dev->data->tx_queues[i];
+
+		DRV_LOG(DEBUG, "Free MR for priv = %p, rxq %u, txq %u",
+			priv, rxq->rxq_idx, txq->txq_idx);
+		mana_mr_btree_free(&rxq->mr_btree);
+		mana_mr_btree_free(&txq->mr_btree);
+	}
+
+	DRV_LOG(DEBUG, "Teardown complete");
+
+	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_EXIT,
+				     rte_memory_order_release);
+
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+
+	/* Wait for the recovery timer before re-probing.
+	 * Can be woken early by PCI remove via condvar signal.
+	 */
+	DRV_LOG(INFO, "Waiting %us for hardware recovery",
 		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
 
-	/* Wait on condvar with timeout — can be woken early by PCI remove */
 	clock_gettime(CLOCK_REALTIME, &ts);
 	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
 
@@ -1425,7 +1481,7 @@ mana_reset_thread(void *arg)
 
 	if (rte_atomic_load_explicit(&priv->dev_state,
 	    rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-		DRV_LOG(INFO, "Reset thread: dev_state=%d, skipping",
+		DRV_LOG(INFO, "Reset thread: dev_state=%d, skipping exit",
 			(int)rte_atomic_load_explicit(&priv->dev_state,
 			rte_memory_order_acquire));
 		pthread_mutex_unlock(&priv->reset_ops_lock);
@@ -1434,13 +1490,22 @@ mana_reset_thread(void *arg)
 
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
-	/* Lock is released by mana_reset_exit_delay at the end of
-	 * the reset exit processing.
+	/* Lock is released by mana_reset_exit_delay.
 	 *
 	 * reset_thread_active is NOT cleared here — the joiner
 	 * (dev_stop_lock/dev_close_lock) is responsible for joining
 	 * and clearing the flag to avoid leaking the thread.
 	 */
+	return 0;
+
+reset_failed:
+	mana_clear_burst_state(dev);
+	pthread_mutex_unlock(&priv->reset_ops_lock);
+
+	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
+		priv->port_id);
+	rte_eth_dev_callback_process(dev,
+		RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
 	return 0;
 }
 
@@ -1452,17 +1517,10 @@ mana_reset_enter(struct mana_priv *priv)
 	struct rte_eth_dev *dev = &rte_eth_devices[priv->port_id];
 
 	/*
-	 * Lock ownership for reset_ops_lock through the reset path:
-	 *
-	 *   mana_intr_handler     — acquires the lock
-	 *   mana_reset_enter      — called with lock held, releases it
-	 *                           after spawning the reset thread
-	 *   mana_reset_thread     — re-acquires the lock after the
-	 *                           recovery delay
-	 *   mana_reset_exit       — called with lock held, passes it
-	 *                           to mana_reset_exit_delay
-	 *   mana_reset_exit_delay — called with lock held, releases it
-	 *                           on completion
+	 * Lock ownership: mana_intr_handler acquires reset_ops_lock,
+	 * mana_reset_enter sets state/drains/spawns thread and releases it.
+	 * The reset thread independently acquires/releases the lock for
+	 * teardown and for the exit (re-probe) phase.
 	 */
 
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_ENTER,
@@ -1505,48 +1563,6 @@ mana_reset_enter(struct mana_priv *priv)
 
 	DRV_LOG(DEBUG, "All data path threads drained");
 
-	/* Stop data path on primary and secondary before unmapping doorbell */
-	ret = mana_dev_stop(dev);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to stop mana dev ret %d", ret);
-		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-				     rte_memory_order_release);
-		goto reset_failed;
-	}
-
-	/* Unmap secondary doorbell pages after data path is stopped */
-	ret = mana_mp_req_on_rxtx(dev, MANA_MP_REQ_RESET_ENTER);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to reset secondary processes ret = %d",
-			ret);
-		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-				     rte_memory_order_release);
-		goto reset_failed;
-	}
-
-	ret = mana_dev_close(dev);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to close mana dev ret %d", ret);
-		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-				     rte_memory_order_release);
-		goto reset_failed;
-	}
-
-	for (i = 0; i < priv->num_queues; i++) {
-		struct mana_rxq *rxq = dev->data->rx_queues[i];
-		struct mana_txq *txq = dev->data->tx_queues[i];
-
-		DRV_LOG(DEBUG, "Free MR for priv = %p, rxq %u, txq %u",
-			priv, rxq->rxq_idx, txq->txq_idx);
-		mana_mr_btree_free(&rxq->mr_btree);
-		mana_mr_btree_free(&txq->mr_btree);
-	}
-
-	DRV_LOG(DEBUG, "Reset processing exited successfully");
-
-	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_EXIT,
-				     rte_memory_order_release);
-
 	/* Join previous reset thread if it completed but was not joined.
 	 * Use CAS to avoid double-join if another path joined first.
 	 * Don't use mana_join_reset_thread() here — we are already in
@@ -1577,7 +1593,6 @@ mana_reset_enter(struct mana_priv *priv)
 
 	DRV_LOG(DEBUG, "Reset thread started");
 
-	/* Release the lock so the application can call dev_stop/dev_close */
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 	return;
 
