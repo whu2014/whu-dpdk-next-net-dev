@@ -208,7 +208,7 @@ mana_tx_burst(void *dpdk_txq, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
 	}
 
 	/* Single atomic CAS: enter burst only if device is active (0→1).
-	 * Fails immediately if reset path has set state bits.
+	 * Fails immediately if reset path has set the blocked bit.
 	 */
 	if (unlikely(!rte_atomic_compare_exchange_strong_explicit(
 			&txq->burst_state, &expected, 1,

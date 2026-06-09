@@ -353,6 +353,12 @@ enum mana_device_state {
 	MANA_DEV_RESET_FAILED	= 3,
 };
 
+/* burst_state bit layout:
+ *   Bit 0: in-burst (set by data path CAS 0→1, cleared on exit).
+ *   Bit 1: blocked  (set by reset path to reject new bursts).
+ */
+#define MANA_BURST_BLOCKED	2
+
 struct mana_priv {
 	struct rte_eth_dev_data *dev_data;
 	struct mana_process_priv *process_priv;
@@ -456,8 +462,8 @@ struct mana_txq {
 
 	/*
 	 * Bit 0: in-burst flag (set by data path, cleared on exit).
-	 * Bits 1+: device state (set by reset path via fetch_or).
-	 * Data path CAS 0→1 to enter; fails if any state bits are set.
+	 * Bit 1: blocked flag (set by reset path via fetch_or).
+	 * Data path CAS 0→1 to enter; fails if blocked bit is set.
 	 */
 	RTE_ATOMIC(uint32_t) burst_state;
 };
@@ -499,8 +505,8 @@ struct mana_rxq {
 
 	/*
 	 * Bit 0: in-burst flag (set by data path, cleared on exit).
-	 * Bits 1+: device state (set by reset path via fetch_or).
-	 * Data path CAS 0→1 to enter; fails if any state bits are set.
+	 * Bit 1: blocked flag (set by reset path via fetch_or).
+	 * Data path CAS 0→1 to enter; fails if blocked bit is set.
 	 */
 	RTE_ATOMIC(uint32_t) burst_state;
 };

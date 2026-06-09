@@ -1491,16 +1491,21 @@ mana_reset_thread(void *arg)
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
 	/* Lock is released by mana_reset_exit_delay.
-	 *
-	 * reset_thread_active is NOT cleared here — the joiner
-	 * (dev_stop_lock/dev_close_lock) is responsible for joining
-	 * and clearing the flag to avoid leaking the thread.
+	 * reset_thread_active is cleared there before emitting
+	 * the recovery event callback.
 	 */
 	return 0;
 
 reset_failed:
 	mana_clear_burst_state(dev);
 	pthread_mutex_unlock(&priv->reset_ops_lock);
+
+	/* Clear before emitting callback — if the callback calls
+	 * dev_stop/dev_close, mana_join_reset_thread must be a no-op
+	 * to avoid self-join deadlock on the current thread.
+	 */
+	rte_atomic_store_explicit(&priv->reset_thread_active,
+		false, rte_memory_order_release);
 
 	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
 		priv->port_id);
@@ -1529,8 +1534,8 @@ mana_reset_enter(struct mana_priv *priv)
 	DRV_LOG(DEBUG, "Entering into device reset state");
 	DRV_LOG(DEBUG, "Resetting dev = %p, priv = %p", dev, priv);
 
-	/* Set state bits on each queue's burst_state so new bursts are
-	 * rejected, then wait for any in-flight burst (bit 0) to finish.
+	/* Set the blocked bit on each queue's burst_state so new bursts
+	 * are rejected, then wait for any in-flight burst (bit 0) to finish.
 	 */
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
@@ -1538,11 +1543,11 @@ mana_reset_enter(struct mana_priv *priv)
 
 		if (rxq)
 			rte_atomic_fetch_or_explicit(&rxq->burst_state,
-				(uint32_t)(MANA_DEV_RESET_ENTER << 1),
+				MANA_BURST_BLOCKED,
 				rte_memory_order_release);
 		if (txq)
 			rte_atomic_fetch_or_explicit(&txq->burst_state,
-				(uint32_t)(MANA_DEV_RESET_ENTER << 1),
+				MANA_BURST_BLOCKED,
 				rte_memory_order_release);
 	}
 
@@ -1729,6 +1734,13 @@ mr_init_failed_rxq:
 
 out:
 	pthread_mutex_unlock(&priv->reset_ops_lock);
+
+	/* Clear before emitting callback — if the callback calls
+	 * dev_stop/dev_close, mana_join_reset_thread must be a no-op
+	 * to avoid self-join deadlock on the current thread.
+	 */
+	rte_atomic_store_explicit(&priv->reset_thread_active,
+		false, rte_memory_order_release);
 
 	if (!ret) {
 		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
