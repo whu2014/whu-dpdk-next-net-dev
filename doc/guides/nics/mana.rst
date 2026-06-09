@@ -82,14 +82,15 @@ via ``IBV_EVENT_DEVICE_FATAL``.
 
 The driver handles this transparently through a two-phase reset flow:
 
-* **Enter phase**: The driver stops the data path,
-  waits for all in-flight burst calls to drain
+* **Enter phase**: The interrupt handler blocks new data path bursts
+  and waits for all in-flight burst calls to drain
   using per-queue atomic flags,
-  tears down IB resources and queues,
-  and unmaps secondary process doorbell pages.
+  then spawns a control thread for the remaining work.
 
-* **Exit phase**: After a delay for hardware recovery,
-  a control thread re-probes the PCI device,
+* **Teardown and exit phase**: The control thread tears down
+  IB resources and queues, unmaps secondary process doorbell pages,
+  and closes the device. After a delay for hardware recovery,
+  it re-probes the PCI device,
   reinstalls the interrupt handler,
   reinitializes resources, and restarts queues.
 
