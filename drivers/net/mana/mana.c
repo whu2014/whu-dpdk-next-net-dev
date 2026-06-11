@@ -1403,6 +1403,9 @@ mana_pci_remove_event_cb(const char *device_name,
 	pthread_cond_signal(&priv->reset_cond);
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
 
+	/* Wait for the reset thread to finish teardown and release
+	 * reset_ops_lock before emitting INTR_RMV to the application.
+	 */
 	pthread_mutex_lock(&priv->reset_ops_lock);
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
@@ -1479,7 +1482,11 @@ mana_reset_thread(void *arg)
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
 	/* Wait for the recovery timer before re-probing.
-	 * Can be woken early by PCI remove via condvar signal.
+	 * Check dev_state under reset_cond_mutex before waiting:
+	 * if mana_pci_remove_event_cb already set RESET_FAILED
+	 * (under the same mutex), we skip the wait entirely.
+	 * This avoids losing a condvar signal that arrived before
+	 * we entered the wait.
 	 */
 	DRV_LOG(INFO, "Waiting %us for hardware recovery",
 		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
@@ -1488,7 +1495,12 @@ mana_reset_thread(void *arg)
 	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
 
 	pthread_mutex_lock(&priv->reset_cond_mutex);
-	pthread_cond_timedwait(&priv->reset_cond, &priv->reset_cond_mutex, &ts);
+	while (rte_atomic_load_explicit(&priv->dev_state,
+	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+		if (pthread_cond_timedwait(&priv->reset_cond,
+		    &priv->reset_cond_mutex, &ts))
+			break; /* timeout */
+	}
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
 
 	pthread_mutex_lock(&priv->reset_ops_lock);
