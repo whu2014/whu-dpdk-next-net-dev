@@ -954,6 +954,9 @@ mana_dev_start_lock(struct rte_eth_dev *dev)
 /*
  * Join the reset thread if it is active. Uses CAS on
  * reset_thread_active to ensure only one caller joins.
+ * If called from the reset thread itself (e.g. via a recovery
+ * event callback that calls dev_stop/dev_close), detach instead
+ * of joining to avoid deadlock and let the thread self-free.
  */
 static void
 mana_join_reset_thread(struct mana_priv *priv)
@@ -964,6 +967,17 @@ mana_join_reset_thread(struct mana_priv *priv)
 			&priv->reset_thread_active, &expected, false,
 			rte_memory_order_acq_rel,
 			rte_memory_order_acquire)) {
+		if (rte_thread_equal(rte_thread_self(),
+				     priv->reset_thread)) {
+			/* Self case: detach so resources are freed on
+			 * thread exit. Don't modify dev_state — the
+			 * caller (dev_stop_lock/dev_close_lock) handles
+			 * state transitions.
+			 */
+			rte_thread_detach(priv->reset_thread);
+			return;
+		}
+
 		pthread_mutex_lock(&priv->reset_cond_mutex);
 		rte_atomic_store_explicit(&priv->dev_state,
 			MANA_DEV_ACTIVE, rte_memory_order_release);
@@ -1491,21 +1505,15 @@ mana_reset_thread(void *arg)
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
 	/* Lock is released by mana_reset_exit_delay.
-	 * reset_thread_active is cleared there before emitting
-	 * the recovery event callback.
+	 * reset_thread_active remains true — the joiner
+	 * (mana_join_reset_thread) will either join or detach
+	 * (if called from this thread's own callback).
 	 */
 	return 0;
 
 reset_failed:
 	mana_clear_burst_state(dev);
 	pthread_mutex_unlock(&priv->reset_ops_lock);
-
-	/* Clear before emitting callback — if the callback calls
-	 * dev_stop/dev_close, mana_join_reset_thread must be a no-op
-	 * to avoid self-join deadlock on the current thread.
-	 */
-	rte_atomic_store_explicit(&priv->reset_thread_active,
-		false, rte_memory_order_release);
 
 	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
 		priv->port_id);
@@ -1734,13 +1742,6 @@ mr_init_failed_rxq:
 
 out:
 	pthread_mutex_unlock(&priv->reset_ops_lock);
-
-	/* Clear before emitting callback — if the callback calls
-	 * dev_stop/dev_close, mana_join_reset_thread must be a no-op
-	 * to avoid self-join deadlock on the current thread.
-	 */
-	rte_atomic_store_explicit(&priv->reset_thread_active,
-		false, rte_memory_order_release);
 
 	if (!ret) {
 		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
