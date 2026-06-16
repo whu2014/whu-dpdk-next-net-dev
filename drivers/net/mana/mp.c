@@ -215,21 +215,24 @@ mana_mp_secondary_handle(const struct rte_mp_msg *mp_msg, const void *peer)
 					"No FD in RESET_EXIT message");
 				res->result = -EINVAL;
 			} else {
-				int fd = mp_msg->fds[0];
-
 				ret = mana_map_doorbell_secondary(dev,
-								  fd);
+							mp_msg->fds[0]);
 				if (ret) {
 					DRV_LOG(ERR,
 						"Failed secondary "
 						"doorbell map %d",
-						fd);
+						mp_msg->fds[0]);
 					res->result = -ENODEV;
 				} else {
 					res->result = 0;
 				}
-				close(fd);
 			}
+
+			/* Close the fd whenever present, even if
+			 * db_page was already mapped.
+			 */
+			if (mp_msg->num_fds >= 1)
+				close(mp_msg->fds[0]);
 		}
 		ret = rte_mp_reply(&mp_res, peer);
 		break;
