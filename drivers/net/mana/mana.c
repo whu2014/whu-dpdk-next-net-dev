@@ -1417,6 +1417,53 @@ mana_pci_remove_event_cb(const char *device_name,
 }
 
 /*
+ * Wait for the recovery timer before re-probing.
+ * Check dev_state under reset_cond_mutex before waiting:
+ * if mana_pci_remove_event_cb already set RESET_FAILED
+ * (under the same mutex), we skip the wait entirely.
+ * This avoids losing a condvar signal that arrived before
+ * we entered the wait.
+ *
+ * The function expects reset_ops_lock to be unlocked on entry.
+ * On success it returns 0 with reset_ops_lock held. If another
+ * path changed dev_state (for example dev_stop/dev_close or
+ * PCI remove), it returns -1 after releasing reset_ops_lock.
+ */
+static int
+mana_reset_wait(struct mana_priv *priv)
+{
+	struct timespec ts;
+
+	DRV_LOG(INFO, "Waiting %us for hardware recovery",
+		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
+
+	pthread_mutex_lock(&priv->reset_cond_mutex);
+	while (rte_atomic_load_explicit(&priv->dev_state,
+	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+		if (pthread_cond_timedwait(&priv->reset_cond,
+		    &priv->reset_cond_mutex, &ts))
+			break; /* timeout */
+	}
+	pthread_mutex_unlock(&priv->reset_cond_mutex);
+
+	pthread_mutex_lock(&priv->reset_ops_lock);
+
+	if (rte_atomic_load_explicit(&priv->dev_state,
+	    rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
+		DRV_LOG(INFO, "Reset thread: dev_state=%d, skipping exit",
+			(int)rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire));
+		pthread_mutex_unlock(&priv->reset_ops_lock);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
  * Reset thread: performs teardown immediately, waits for the
  * recovery timer, then re-probes and restarts the device.
  * Runs on a control thread so it can call blocking IPC, ibv
@@ -1428,7 +1475,6 @@ mana_reset_thread(void *arg)
 {
 	struct mana_priv *priv = (struct mana_priv *)arg;
 	struct rte_eth_dev *dev = &rte_eth_devices[priv->port_id];
-	struct timespec ts;
 	int ret;
 	int i;
 
@@ -1481,38 +1527,8 @@ mana_reset_thread(void *arg)
 
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
-	/* Wait for the recovery timer before re-probing.
-	 * Check dev_state under reset_cond_mutex before waiting:
-	 * if mana_pci_remove_event_cb already set RESET_FAILED
-	 * (under the same mutex), we skip the wait entirely.
-	 * This avoids losing a condvar signal that arrived before
-	 * we entered the wait.
-	 */
-	DRV_LOG(INFO, "Waiting %us for hardware recovery",
-		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
-
-	clock_gettime(CLOCK_REALTIME, &ts);
-	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
-
-	pthread_mutex_lock(&priv->reset_cond_mutex);
-	while (rte_atomic_load_explicit(&priv->dev_state,
-	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
-		if (pthread_cond_timedwait(&priv->reset_cond,
-		    &priv->reset_cond_mutex, &ts))
-			break; /* timeout */
-	}
-	pthread_mutex_unlock(&priv->reset_cond_mutex);
-
-	pthread_mutex_lock(&priv->reset_ops_lock);
-
-	if (rte_atomic_load_explicit(&priv->dev_state,
-	    rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-		DRV_LOG(INFO, "Reset thread: dev_state=%d, skipping exit",
-			(int)rte_atomic_load_explicit(&priv->dev_state,
-			rte_memory_order_acquire));
-		pthread_mutex_unlock(&priv->reset_ops_lock);
+	if (mana_reset_wait(priv))
 		return 0;
-	}
 
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
@@ -1661,7 +1677,17 @@ mana_reset_exit_delay(void *arg)
 	}
 	priv->ib_ctx = NULL;
 
+retry_probe:
 	ret = mana_pci_probe(NULL, pci_dev);
+	if (ret == -ENODEV) {
+		DRV_LOG(WARNING,
+			"MANA device not ready after reset, retrying in %us",
+			(unsigned int)(MANA_RESET_TIMER_US / 1000000));
+		pthread_mutex_unlock(&priv->reset_ops_lock);
+		if (mana_reset_wait(priv))
+			return 0;
+		goto retry_probe;
+	}
 	if (ret) {
 		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
 		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,

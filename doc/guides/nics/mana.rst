@@ -90,8 +90,10 @@ Enter phase
 Teardown and exit phase
    The control thread tears down IB resources and queues,
    unmaps secondary process doorbell pages, and closes the device.
-   After a delay for hardware recovery, it re-probes the PCI device,
-   reinstalls the interrupt handler, reinitializes resources, and restarts queues.
+   After a delay for hardware recovery, it re-probes the PCI device.
+   If the device is still unavailable, it waits 15 seconds and retries
+   until the device returns, reinstalls the interrupt handler,
+   reinitializes resources, and restarts queues.
 
 The driver emits the following ethdev recovery events
 to notify upper layers (e.g. netvsc) of the reset lifecycle:
